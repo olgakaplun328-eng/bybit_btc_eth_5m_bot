@@ -1,24 +1,33 @@
-Binance USDⓈ-M Futures 5m signal bot (alerts only)
+BINANCE FUTURES 5m TELEGRAM SIGNAL BOT
 
-Railway Variables:
-- TELEGRAM_BOT_TOKEN = your Telegram bot token
-- TELEGRAM_CHAT_ID = your Telegram chat ID (or comma-separated IDs)
-- BINANCE_SYMBOLS = BTCUSDT,ETHUSDT
-- POLL_SECONDS = 10 (optional)
-- TEST_MODE = false
+Files:
+- bot.py
+- requirements.txt
 
-Start command: python bot.py
+Railway setup:
+1. Upload these files to your project/repository.
+2. Set Start Command to: python bot.py
+3. Set Railway Variables:
+   TELEGRAM_BOT_TOKEN = your Telegram bot token
+   TELEGRAM_CHAT_ID = your chat ID (or comma-separated IDs)
+   BINANCE_SYMBOLS = BTCUSDT,ETHUSDT
+   TEST_MODE = false
+   POLL_SECONDS = 10   (optional)
 
-Market data source:
+Data source:
+Public Binance USDⓈ-M Futures REST klines endpoint:
 https://fapi.binance.com/fapi/v1/klines
-Public candles only; no Binance API key is needed for this endpoint.
+Uses native 5m candles; no Binance API key is needed for public candle data.
+Optional variable BINANCE_FUTURES_API_URL can override the endpoint.
 
-Rules unchanged:
+Rules:
 - RED RED RED GREEN GREEN => SHORT
 - GREEN GREEN GREEN RED RED => LONG
-- PRE alert during the last 60 seconds of candle #5
-- SIGNAL after candle #5 closes
-- WIN/LOSS evaluated over candles #6 through #11
-- No orders are placed.
+- PRE alert during the final 60 seconds of candle #5, when the pattern is present.
+- SIGNAL after candle #5 closes.
+- WIN if expected-color candle appears in candles #6-#11; otherwise LOSS after #11 closes.
+- Telegram alerts only; no orders are placed.
+- Display times use Europe/Kyiv.
 
-Set TEST_MODE=true to run offline logic tests only. It exits after tests and does not run the bot loop.
+Offline rule test:
+Set TEST_MODE=true and run `python bot.py`. This runs local logic tests and exits; it does not contact Binance or Telegram.

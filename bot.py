@@ -37,7 +37,7 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("bybit-signal-bot-5m")
+log = logging.getLogger("binance-futures-signal-bot-5m")
 SESSION = requests.Session()
 SESSION.headers.update({
     "User-Agent": "Mozilla/5.0 (compatible; BinanceFuturesSignalBot/1.0)",
