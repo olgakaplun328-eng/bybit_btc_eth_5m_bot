@@ -21,7 +21,7 @@ def normalize_symbol(value):
     return value
 
 
-SYMBOLS = [normalize_symbol(s) for s in os.getenv("BYBIT_SYMBOLS", "BTCUSDT,ETHUSDT").split(",")]
+SYMBOLS = [normalize_symbol(s) for s in os.getenv("BINANCE_SYMBOLS", "BTCUSDT,ETHUSDT").split(",")]
 SYMBOLS = list(dict.fromkeys(s for s in SYMBOLS if s))
 POLL_SECONDS = max(5, int(os.getenv("POLL_SECONDS", "10")))
 TEST_MODE = os.getenv("TEST_MODE", "false").strip().lower() in ("1", "true", "yes", "on")
@@ -31,14 +31,7 @@ STATE_DIR = os.getenv("STATE_DIR", "state")
 TIMEFRAME_SECONDS = 300
 TIMEFRAME_LABEL = "5m"
 
-# Railway can override the endpoint with BYBIT_API_URL.
-# Try api.bytick.com first; if it fails, fall back to api.bybit.com.
-_CUSTOM_API_URL = os.getenv("BYBIT_API_URL", "").strip()
-_DEFAULT_API_URLS = [
-    "https://api.bytick.com/v5/market/kline",
-    "https://api.bybit.com/v5/market/kline",
-]
-API_URLS = ([_CUSTOM_API_URL] + [u for u in _DEFAULT_API_URLS if u != _CUSTOM_API_URL]) if _CUSTOM_API_URL else _DEFAULT_API_URLS
+API_URL = os.getenv("BINANCE_FUTURES_API_URL", "https://fapi.binance.com/fapi/v1/klines").strip()
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -47,7 +40,7 @@ logging.basicConfig(
 log = logging.getLogger("bybit-signal-bot-5m")
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (compatible; BybitSignalBot/1.0)",
+    "User-Agent": "Mozilla/5.0 (compatible; BinanceFuturesSignalBot/1.0)",
     "Accept": "application/json",
     "Cache-Control": "no-cache",
 })
@@ -101,72 +94,43 @@ def send(message):
     return success
 
 
-def parse_bybit_ts(value):
-    timestamp = int(float(value))
-    return timestamp // 1000 if timestamp > 10_000_000_000 else timestamp
+def parse_binance_ts(value):
+    """Binance kline open times are Unix timestamps in milliseconds."""
+    return int(value) // 1000
 
 
 def fetch_candles(symbol, limit=200):
-    """Fetch Bybit V5 linear futures candles; rotate endpoint on HTTP/network failures."""
-    last_error = None
-    for api_url in API_URLS:
+    """Fetch public Binance USDⓈ-M Futures 5m klines (no API key required)."""
+    try:
+        response = SESSION.get(
+            API_URL,
+            params={"symbol": symbol, "interval": "5m", "limit": limit},
+            timeout=15,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        body = getattr(getattr(exc, "response", None), "text", "")[:500]
+        raise RuntimeError(f"Binance Futures request failed for {symbol}: {exc}; body={body}") from exc
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError(f"Binance returned non-JSON for {symbol}: {response.text[:250]}") from exc
+    if not isinstance(payload, list) or not payload:
+        raise RuntimeError(f"Binance returned no klines for {symbol}: {str(payload)[:250]}")
+
+    now = int(time.time())
+    rows = []
+    for row in payload:
         try:
-            response = SESSION.get(
-                api_url,
-                params={"category": "linear", "symbol": symbol, "interval": "5", "limit": limit},
-                timeout=15,
-            )
-        except requests.RequestException as exc:
-            last_error = f"{api_url}: connection error: {exc}"
-            log.warning("Bybit request failed via %s: %s", api_url, exc)
+            rows.append({"ts": parse_binance_ts(row[0]), "open": float(row[1]), "close": float(row[4])})
+        except (IndexError, TypeError, ValueError):
             continue
-
-        if not response.ok:
-            body = response.text[:1000].replace("\n", " ").replace("\r", " ")
-            last_error = f"{api_url}: HTTP {response.status_code}: {body[:250]}"
-            log.error(
-                "Bybit endpoint returned HTTP %s | endpoint=%s | request_url=%s | body=%s",
-                response.status_code, api_url, response.url, body,
-            )
-            # Continue to the next host: a 403 may be specific to a host or network route.
-            continue
-
-        try:
-            payload = response.json()
-        except ValueError:
-            last_error = f"{api_url}: non-JSON response: {response.text[:250]}"
-            log.warning("Bybit returned non-JSON via %s: %s", api_url, response.text[:250].replace("\n", " "))
-            continue
-
-        if payload.get("retCode") != 0:
-            last_error = f"{api_url}: Bybit API error {payload.get('retCode')}: {payload.get('retMsg')}"
-            log.warning("%s", last_error)
-            continue
-
-        raw_rows = (payload.get("result") or {}).get("list") or []
-        if not raw_rows:
-            last_error = f"{api_url}: Bybit returned an empty candle list for {symbol}"
-            log.warning("%s", last_error)
-            continue
-
-        now = int(time.time())
-        by_timestamp = {}
-        for row in raw_rows:
-            try:
-                ts = parse_bybit_ts(row[0])
-                by_timestamp[ts] = {"ts": ts, "open": float(row[1]), "close": float(row[4])}
-            except (IndexError, TypeError, ValueError):
-                continue
-        rows = [by_timestamp[k] for k in sorted(by_timestamp)]
-        closed = [c for c in rows if c["ts"] + TIMEFRAME_SECONDS <= now]
-        live_rows = [c for c in rows if c["ts"] <= now < c["ts"] + TIMEFRAME_SECONDS]
-        log.debug("Fetched %d closed candles for %s from %s", len(closed), symbol, api_url)
-        return closed[-150:], (live_rows[-1] if live_rows else None)
-
-    raise RuntimeError(
-        f"All Bybit endpoints failed for {symbol}. Last error: {last_error}. "
-        "If both hosts return HTTP 403, check Railway region/network restrictions; code changes alone may not resolve it."
-    )
+    rows.sort(key=lambda candle: candle["ts"])
+    closed = [c for c in rows if c["ts"] + TIMEFRAME_SECONDS <= now]
+    live_rows = [c for c in rows if c["ts"] <= now < c["ts"] + TIMEFRAME_SECONDS]
+    log.debug("Fetched %d closed Binance Futures candles for %s", len(closed), symbol)
+    return closed[-150:], (live_rows[-1] if live_rows else None)
 
 
 class Engine:
@@ -238,7 +202,7 @@ class Engine:
         self.pre_sent.add(candle_ts)
         pattern_text = "🔴🔴🔴🟢🟢" if direction == "SHORT" else "🟢🟢🟢🔴🔴"
         send(
-            f"⚠️ PRE-ALERT\n{self.symbol} Bybit Futures | 5m\n{pattern_text}\n"
+            f"⚠️ PRE-ALERT\n{self.symbol} Binance Futures | 5m\n{pattern_text}\n"
             f"Potential: {direction}\nCandle #5 closes at {kyiv(candle_ts + TIMEFRAME_SECONDS)} Kyiv time."
         )
 
@@ -258,7 +222,7 @@ class Engine:
                 self.pending.append({"start_ts": block[0]["ts"], "signal_ts": ts, "direction": direction})
                 pattern_text = "🔴🔴🔴🟢🟢" if direction == "SHORT" else "🟢🟢🟢🔴🔴"
                 send(
-                    f"🔔 SIGNAL {direction}\n{self.symbol} Bybit Futures | 5m\n{pattern_text}\n"
+                    f"🔔 SIGNAL {direction}\n{self.symbol} Binance Futures | 5m\n{pattern_text}\n"
                     f"Pattern closed: {kyiv(ts + TIMEFRAME_SECONDS)} Kyiv time\nChecking candles #6–#11."
                 )
                 log.info("%s SIGNAL %s at %s", self.symbol, direction, kyiv(ts))
@@ -277,14 +241,14 @@ class Engine:
             # Evaluate #6 through #11 inclusive; a matching #11 is still a WIN.
             if actual == expected:
                 send(
-                    f"✅ WIN\n{self.symbol} Bybit Futures | 5m\nDirection: {pending['direction']}\n"
+                    f"✅ WIN\n{self.symbol} Binance Futures | 5m\nDirection: {pending['direction']}\n"
                     f"Matching candle: #{elapsed_candles + 5} {emoji(actual)}\n"
                     f"Signal: {kyiv(pending.get('start_ts', pending['signal_ts']))} Kyiv time."
                 )
                 continue
             if elapsed_candles >= 6:
                 send(
-                    f"❌ LOSS\n{self.symbol} Bybit Futures | 5m\nDirection: {pending['direction']}\n"
+                    f"❌ LOSS\n{self.symbol} Binance Futures | 5m\nDirection: {pending['direction']}\n"
                     "No matching candle appeared in candles #6–#11."
                 )
                 continue
@@ -345,12 +309,12 @@ def main():
         test()
         return
     if not SYMBOLS:
-        raise RuntimeError("BYBIT_SYMBOLS is empty; set it to BTCUSDT,ETHUSDT")
+        raise RuntimeError("BINANCE_SYMBOLS is empty; set it to BTCUSDT,ETHUSDT")
     engines = [Engine(symbol) for symbol in SYMBOLS]
-    log.info("Started Bybit Futures signal bot for %s on native 5m candles", ", ".join(SYMBOLS))
+    log.info("Started Binance Futures signal bot for %s on native 5m candles", ", ".join(SYMBOLS))
     log.info("Patterns: 🔴🔴🔴🟢🟢 => SHORT; 🟢🟢🟢🔴🔴 => LONG; result window #6–#11")
     if TOKEN and CHAT_IDS:
-        send("🤖 Bybit 5m signal bot online\nSymbols: " + ", ".join(SYMBOLS) + "\nAlerts only — no automatic orders.")
+        send("🤖 Binance Futures 5m signal bot online\nSymbols: " + ", ".join(SYMBOLS) + "\nAlerts only — no automatic orders.")
     while True:
         for engine in engines:
             try:
