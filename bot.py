@@ -18,10 +18,10 @@ def normalize_symbol(value):
         return ""
     if not value.endswith("USDT"):
         value += "USDT"
-    return value
+    return value[:-4] + "_USDT"
 
 
-SYMBOLS = [normalize_symbol(s) for s in os.getenv("BINANCE_SYMBOLS", "BTCUSDT,ETHUSDT").split(",")]
+SYMBOLS = [normalize_symbol(s) for s in os.getenv("MEXC_SYMBOLS", "BTCUSDT,ETHUSDT").split(",")]
 SYMBOLS = list(dict.fromkeys(s for s in SYMBOLS if s))
 POLL_SECONDS = max(5, int(os.getenv("POLL_SECONDS", "10")))
 TEST_MODE = os.getenv("TEST_MODE", "false").strip().lower() in ("1", "true", "yes", "on")
@@ -31,16 +31,16 @@ STATE_DIR = os.getenv("STATE_DIR", "state")
 TIMEFRAME_SECONDS = 300
 TIMEFRAME_LABEL = "5m"
 
-API_URL = os.getenv("BINANCE_FUTURES_API_URL", "https://fapi.binance.com/fapi/v1/klines").strip()
+API_URL = os.getenv("MEXC_FUTURES_API_URL", "https://api.mexc.com/api/v1/contract/kline").strip().rstrip("/")
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("binance-futures-signal-bot-5m")
+log = logging.getLogger("mexc-futures-signal-bot-5m")
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (compatible; BinanceFuturesSignalBot/1.0)",
+    "User-Agent": "Mozilla/5.0 (compatible; MEXCFuturesSignalBot/1.0)",
     "Accept": "application/json",
     "Cache-Control": "no-cache",
 })
@@ -94,42 +94,48 @@ def send(message):
     return success
 
 
-def parse_binance_ts(value):
-    """Binance kline open times are Unix timestamps in milliseconds."""
-    return int(value) // 1000
+def parse_mexc_ts(value):
+    """MEXC contract kline timestamps are Unix seconds."""
+    return int(value)
 
 
 def fetch_candles(symbol, limit=200):
-    """Fetch public Binance USDⓈ-M Futures 5m klines (no API key required)."""
+    """Fetch public MEXC perpetual futures 5m klines (no API key required)."""
+    now = int(time.time())
+    params = {
+        "interval": "Min5",
+        "start": now - limit * TIMEFRAME_SECONDS,
+        "end": now,
+    }
+    url = f"{API_URL}/{symbol}"
     try:
-        response = SESSION.get(
-            API_URL,
-            params={"symbol": symbol, "interval": "5m", "limit": limit},
-            timeout=15,
-        )
+        response = SESSION.get(url, params=params, timeout=15)
         response.raise_for_status()
     except requests.RequestException as exc:
         body = getattr(getattr(exc, "response", None), "text", "")[:500]
-        raise RuntimeError(f"Binance Futures request failed for {symbol}: {exc}; body={body}") from exc
+        raise RuntimeError(f"MEXC Futures request failed for {symbol}: {exc}; body={body}") from exc
 
     try:
         payload = response.json()
     except ValueError as exc:
-        raise RuntimeError(f"Binance returned non-JSON for {symbol}: {response.text[:250]}") from exc
-    if not isinstance(payload, list) or not payload:
-        raise RuntimeError(f"Binance returned no klines for {symbol}: {str(payload)[:250]}")
+        raise RuntimeError(f"MEXC returned non-JSON for {symbol}: {response.text[:250]}") from exc
+    if not isinstance(payload, dict) or not payload.get("success") or not isinstance(payload.get("data"), dict):
+        raise RuntimeError(f"MEXC returned no klines for {symbol}: {str(payload)[:250]}")
 
-    now = int(time.time())
+    data = payload["data"]
+    times = data.get("time", [])
+    opens = data.get("open", [])
+    closes = data.get("close", [])
     rows = []
-    for row in payload:
+    for ts, open_price, close_price in zip(times, opens, closes):
         try:
-            rows.append({"ts": parse_binance_ts(row[0]), "open": float(row[1]), "close": float(row[4])})
-        except (IndexError, TypeError, ValueError):
+            rows.append({"ts": parse_mexc_ts(ts), "open": float(open_price), "close": float(close_price)})
+        except (TypeError, ValueError):
             continue
     rows.sort(key=lambda candle: candle["ts"])
     closed = [c for c in rows if c["ts"] + TIMEFRAME_SECONDS <= now]
     live_rows = [c for c in rows if c["ts"] <= now < c["ts"] + TIMEFRAME_SECONDS]
-    log.debug("Fetched %d closed Binance Futures candles for %s", len(closed), symbol)
+    log.debug("Fetched %d closed MEXC Futures candles for %s", len(closed), symbol)
     return closed[-150:], (live_rows[-1] if live_rows else None)
 
 
@@ -202,7 +208,7 @@ class Engine:
         self.pre_sent.add(candle_ts)
         pattern_text = "🔴🔴🔴🟢🟢" if direction == "SHORT" else "🟢🟢🟢🔴🔴"
         send(
-            f"⚠️ PRE-ALERT\n{self.symbol} Binance Futures | 5m\n{pattern_text}\n"
+            f"⚠️ PRE-ALERT\n{self.symbol} MEXC Futures | 5m\n{pattern_text}\n"
             f"Potential: {direction}\nCandle #5 closes at {kyiv(candle_ts + TIMEFRAME_SECONDS)} Kyiv time."
         )
 
@@ -222,7 +228,7 @@ class Engine:
                 self.pending.append({"start_ts": block[0]["ts"], "signal_ts": ts, "direction": direction})
                 pattern_text = "🔴🔴🔴🟢🟢" if direction == "SHORT" else "🟢🟢🟢🔴🔴"
                 send(
-                    f"🔔 SIGNAL {direction}\n{self.symbol} Binance Futures | 5m\n{pattern_text}\n"
+                    f"🔔 SIGNAL {direction}\n{self.symbol} MEXC Futures | 5m\n{pattern_text}\n"
                     f"Pattern closed: {kyiv(ts + TIMEFRAME_SECONDS)} Kyiv time\nChecking candles #6–#11."
                 )
                 log.info("%s SIGNAL %s at %s", self.symbol, direction, kyiv(ts))
@@ -241,14 +247,14 @@ class Engine:
             # Evaluate #6 through #11 inclusive; a matching #11 is still a WIN.
             if actual == expected:
                 send(
-                    f"✅ WIN\n{self.symbol} Binance Futures | 5m\nDirection: {pending['direction']}\n"
+                    f"✅ WIN\n{self.symbol} MEXC Futures | 5m\nDirection: {pending['direction']}\n"
                     f"Matching candle: #{elapsed_candles + 5} {emoji(actual)}\n"
                     f"Signal: {kyiv(pending.get('start_ts', pending['signal_ts']))} Kyiv time."
                 )
                 continue
             if elapsed_candles >= 6:
                 send(
-                    f"❌ LOSS\n{self.symbol} Binance Futures | 5m\nDirection: {pending['direction']}\n"
+                    f"❌ LOSS\n{self.symbol} MEXC Futures | 5m\nDirection: {pending['direction']}\n"
                     "No matching candle appeared in candles #6–#11."
                 )
                 continue
@@ -309,12 +315,12 @@ def main():
         test()
         return
     if not SYMBOLS:
-        raise RuntimeError("BINANCE_SYMBOLS is empty; set it to BTCUSDT,ETHUSDT")
+        raise RuntimeError("MEXC_SYMBOLS is empty; set it to BTCUSDT,ETHUSDT")
     engines = [Engine(symbol) for symbol in SYMBOLS]
-    log.info("Started Binance Futures signal bot for %s on native 5m candles", ", ".join(SYMBOLS))
+    log.info("Started MEXC Futures signal bot for %s on native 5m candles", ", ".join(SYMBOLS))
     log.info("Patterns: 🔴🔴🔴🟢🟢 => SHORT; 🟢🟢🟢🔴🔴 => LONG; result window #6–#11")
     if TOKEN and CHAT_IDS:
-        send("🤖 Binance Futures 5m signal bot online\nSymbols: " + ", ".join(SYMBOLS) + "\nAlerts only — no automatic orders.")
+        send("🤖 MEXC Futures 5m signal bot online\nSymbols: " + ", ".join(SYMBOLS) + "\nAlerts only — no automatic orders.")
     while True:
         for engine in engines:
             try:
