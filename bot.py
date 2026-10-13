@@ -72,6 +72,13 @@ def fetch_candles(symbol, limit=200):
     """Fetch native Bybit V5 linear-futures 5-minute candles."""
     api_symbol = symbol.replace("_", "")
     r = SESSION.get(API_URL, params={"category": "linear", "symbol": api_symbol, "interval": "5", "limit": limit}, timeout=15)
+    if not r.ok:
+    log.warning(
+        "BYBIT HTTP %s | URL=%s | BODY=%s",
+        r.status_code,
+        r.url,
+        r.text[:1000]
+    )
     r.raise_for_status()
     payload = r.json()
     if payload.get("retCode") != 0:
