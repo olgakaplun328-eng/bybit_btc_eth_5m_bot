@@ -10,7 +10,7 @@ Telegram alerts only. This project does **not** place or manage orders.
 - `PRE-ALERT` can be sent during the last 60 seconds of candle #5 if the pattern currently matches. The live candle can change before close, so PRE-ALERT is not a confirmed signal.
 - Outcome window: candles #6 through #11 inclusive. SHORT wins on a red candle; LONG wins on a green candle. A matching candle #11 is a WIN; otherwise LOSS is sent after #11 closes.
 - Uses Kyiv local time in messages.
-- Logs HTTP status and response snippets, and tries `api.bytick.com` if `api.bybit.com` fails. This fallback may not overcome every hosting-region/network restriction.
+- Logs HTTP status and response snippets, and tries `api.bytick.com` first and falls back to `api.bybit.com`. This fallback may not overcome every hosting-region/network restriction.
 - Saves pending signal outcomes in `state/` so they can survive process restarts.
 
 ## Run locally
@@ -29,7 +29,7 @@ Telegram alerts only. This project does **not** place or manage orders.
    - `POLL_SECONDS` = `10`
    - `TEST_MODE` = `false`
 3. Start command: `python bot.py`.
-4. Check Railway logs. If one Bybit host returns 403, the bot tries the alternate host and logs each status/body snippet. If both return 403, the Railway network/region may be blocked; changing code alone cannot guarantee access.
+4. Check Railway logs. The bot tries `api.bytick.com` first and then `api.bybit.com`; it logs each endpoint, request URL, HTTP status, and response body snippet. You can override the first endpoint using `BYBIT_API_URL`. If both return 403, the Railway network/region may be blocked; changing code alone cannot guarantee access.
 
 ## Security
 - Never hard-code Telegram tokens in `bot.py` or commit `.env`.

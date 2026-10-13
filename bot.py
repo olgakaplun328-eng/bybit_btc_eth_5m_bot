@@ -31,12 +31,14 @@ STATE_DIR = os.getenv("STATE_DIR", "state")
 TIMEFRAME_SECONDS = 300
 TIMEFRAME_LABEL = "5m"
 
-# You can set BYBIT_API_URL in Railway to force a particular V5 endpoint.
-# If the default host is blocked from the deployment region, try api.bytick.com.
-API_URLS = [os.getenv("BYBIT_API_URL", "").strip()] if os.getenv("BYBIT_API_URL", "").strip() else [
-    "https://api.bybit.com/v5/market/kline",
+# Railway can override the endpoint with BYBIT_API_URL.
+# Try api.bytick.com first; if it fails, fall back to api.bybit.com.
+_CUSTOM_API_URL = os.getenv("BYBIT_API_URL", "").strip()
+_DEFAULT_API_URLS = [
     "https://api.bytick.com/v5/market/kline",
+    "https://api.bybit.com/v5/market/kline",
 ]
+API_URLS = ([_CUSTOM_API_URL] + [u for u in _DEFAULT_API_URLS if u != _CUSTOM_API_URL]) if _CUSTOM_API_URL else _DEFAULT_API_URLS
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -120,9 +122,13 @@ def fetch_candles(symbol, limit=200):
             continue
 
         if not response.ok:
-            last_error = f"{api_url}: HTTP {response.status_code}: {response.text[:250]}"
-            log.warning("Bybit endpoint returned HTTP %s via %s: %s", response.status_code, api_url, response.text[:250].replace("\n", " "))
-            # A 4xx may be host/region-specific; try the alternate endpoint too.
+            body = response.text[:1000].replace("\n", " ").replace("\r", " ")
+            last_error = f"{api_url}: HTTP {response.status_code}: {body[:250]}"
+            log.error(
+                "Bybit endpoint returned HTTP %s | endpoint=%s | request_url=%s | body=%s",
+                response.status_code, api_url, response.url, body,
+            )
+            # Continue to the next host: a 403 may be specific to a host or network route.
             continue
 
         try:
@@ -157,7 +163,10 @@ def fetch_candles(symbol, limit=200):
         log.debug("Fetched %d closed candles for %s from %s", len(closed), symbol, api_url)
         return closed[-150:], (live_rows[-1] if live_rows else None)
 
-    raise RuntimeError(f"All Bybit endpoints failed for {symbol}. Last error: {last_error}")
+    raise RuntimeError(
+        f"All Bybit endpoints failed for {symbol}. Last error: {last_error}. "
+        "If both hosts return HTTP 403, check Railway region/network restrictions; code changes alone may not resolve it."
+    )
 
 
 class Engine:
