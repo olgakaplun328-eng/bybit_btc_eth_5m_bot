@@ -158,7 +158,7 @@ class Engine:
             if direction:
                 self.pending.append({"start_ts": block[0]["ts"], "signal_ts": ts, "direction": direction})
                 patt = "🔴🔴🔴🟢🟢" if direction == "SHORT" else "🟢🟢🟢🔴🔴"
-                send(f"🔔 SIGNAL {direction}\n{display_symbol(self.symbol)} Bybit Futures | 5m\n{patt}\nPattern closed: {kyiv(ts + TIMEFRAME_SECONDS)} Kyiv time\nChecking candles #6–#10.")
+                send(f"🔔 SIGNAL {direction}\n{display_symbol(self.symbol)} Bybit Futures | 5m\n{patt}\nPattern closed: {kyiv(ts + TIMEFRAME_SECONDS)} Kyiv time\nChecking candles #6–#11.")
                 log.info("%s SIGNAL %s at %s", self.symbol, direction, kyiv(ts))
 
         keep = []
@@ -166,17 +166,17 @@ class Engine:
             if ts <= p["signal_ts"]:
                 keep.append(p)
                 continue
-            rel = int((ts - p["signal_ts"]) // TIMEFRAME_SECONDS)  # rel=1 is candle #6; rel=5 is #10
+            rel = int((ts - p["signal_ts"]) // TIMEFRAME_SECONDS)  # rel=1 is candle #6; rel=6 is #11
             if rel < 1:
                 keep.append(p)
                 continue
             # Match the original strategy's outcome rule: SHORT wins on RED; LONG wins on GREEN.
             want = "RED" if p["direction"] == "SHORT" else "GREEN"
-            if rel <= 5 and color(c) == want:
+            if rel <= 6 and color(c) == want:
                 send(f"✅ WIN\n{display_symbol(self.symbol)} Bybit Futures | 5m\nDirection: {p['direction']}\nMatching candle: #{rel + 5} {emoji(color(c))}\nSignal: {kyiv(p['start_ts'])} Kyiv time.")
                 continue
-            if rel >= 5:
-                send(f"❌ LOSS\n{display_symbol(self.symbol)} Bybit Futures | 5m\nDirection: {p['direction']}\nNo matching candle appeared in candles #6–#10.")
+            if rel >= 6:
+                send(f"❌ LOSS\n{display_symbol(self.symbol)} Bybit Futures | 5m\nDirection: {p['direction']}\nNo matching candle appeared in candles #6–#11.")
                 continue
             keep.append(p)
         self.pending = keep
@@ -224,7 +224,7 @@ def main():
         raise RuntimeError("BYBIT_SYMBOLS is empty; set it to BTCUSDT,ETHUSDT")
     engines = [Engine(s) for s in SYMBOLS]
     log.info("Started Bybit Futures signal bot for %s on 5m", ", ".join(SYMBOLS))
-    log.info("Patterns: RRR-GG => SHORT; GGG-RR => LONG. Results: candles #6-#10.")
+    log.info("Patterns: RRR-GG => SHORT; GGG-RR => LONG. Results: candles #6-#11.")
     if TOKEN and CHAT_IDS:
         send("🤖 Bybit 5m signal bot online\nSymbols: " + ", ".join(display_symbol(s) for s in SYMBOLS) + "\nSignal alerts only; no automatic orders.")
     while True:

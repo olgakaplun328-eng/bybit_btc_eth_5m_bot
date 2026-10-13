@@ -8,7 +8,7 @@ Alerts only; this bot does not place orders.
 - Pattern: RRR → GG = SHORT; GGG → RR = LONG
 - PRE-ALERT: during the last minute of candle #5 if the live pattern still matches
 - SIGNAL: after candle #5 closes and confirms
-- Result check: candles #6–#10
+- Result check: candles #6–#11 (inclusive)
 - Telegram only; no automatic trades
 
 ## Railway variables
