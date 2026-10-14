@@ -1,28 +1,25 @@
-MEXC FUTURES 5m TELEGRAM SIGNAL BOT
+MEXC FUTURES SIGNAL BOT — NATIVE 5m
 
-Data source: MEXC perpetual futures public K-line API (Min5).
-Endpoint: https://api.mexc.com/api/v1/contract/kline/{symbol}
-No exchange API key is needed for public candles. This bot sends alerts only; it does not place orders.
+Files: bot.py, requirements.txt, Procfile, railway.json, README_MEXC.txt
 
-Railway setup
-1. Upload this ZIP / place the five files in your Railway project.
-2. Start command: python bot.py
-3. Add variables:
-   TELEGRAM_BOT_TOKEN = your Telegram bot token
-   TELEGRAM_CHAT_ID = your chat ID (multiple IDs may be comma-separated)
-   MEXC_SYMBOLS = BTCUSDT,ETHUSDT
-   TEST_MODE = false
-   POLL_SECONDS = 10   (optional)
+Railway Variables:
+TELEGRAM_BOT_TOKEN=your Telegram bot token
+TELEGRAM_CHAT_ID=your chat id (multiple IDs comma-separated)
+MEXC_SYMBOLS=BTCUSDT,ETHUSDT
+TEST_MODE=false
+POLL_SECONDS=10 (optional)
 
-Symbol names are automatically converted to MEXC contract format (BTC_USDT, ETH_USDT).
+MEXC source: public Contract K-line API, interval=Min5 (native 5-minute candles).
+Symbols are converted to MEXC contract form BTC_USDT and ETH_USDT. No MEXC API key is required for public candle data.
 
-Rules
-- 🔴🔴🔴🟢🟢 => SHORT
-- 🟢🟢🟢🔴🔴 => LONG
-- PRE-ALERT during the final minute of candle #5
-- SIGNAL after candle #5 closes
-- WIN if the expected-color candle appears in candles #6–#11; otherwise LOSS after #11 closes
-- Display times use Europe/Kyiv
+Rules:
+- 🟢🟢🟢🔴🔴🔴 => LONG
+- 🔴🔴🔴🟢🟢🟢 => SHORT
+- PRE-ALERT during the final minute of candle #6
+- SIGNAL only after candle #6 closes
+- WIN if expected color appears in candle #7, #8, #9, #10, #11, or #12
+- LOSS only after candle #12 closes without a matching candle
+- Alerts only; no orders are placed.
 
-For offline logic checks set TEST_MODE=true and run: python bot.py
-Note: endpoint access must be confirmed from your Railway deployment; access may vary by hosting region/network.
+Deploy: upload all files to Railway. Start command: python bot.py. Add the variables above.
+Offline test: set TEST_MODE=true and run python bot.py. This does not test live MEXC/Telegram connectivity.

@@ -3,332 +3,301 @@ import logging
 import os
 import time
 from collections import OrderedDict
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import requests
 from dotenv import load_dotenv
 
 load_dotenv()
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+CHAT_IDS = [x.strip() for x in os.getenv("TELEGRAM_CHAT_ID", "").split(",") if x.strip()]
+TIMEFRAME_SECONDS = 300
+TIMEFRAME_LABEL = "5m"
+DEFAULT_SYMBOLS = "BTCUSDT,ETHUSDT"
+POLL_SECONDS = max(5, int(os.getenv("POLL_SECONDS", "10")))
+TEST_MODE = os.getenv("TEST_MODE", "false").strip().lower() in {"1", "true", "yes", "on"}
+API_URL = os.getenv("MEXC_FUTURES_KLINE_URL", "https://contract.mexc.com/api/v1/contract/kline/{symbol}").strip()
 
 
 def normalize_symbol(value):
-    value = value.strip().upper().replace("/", "").replace("_", "").replace("-", "")
-    if not value:
+    s = value.strip().upper().replace("_", "")
+    if not s:
         return ""
-    if not value.endswith("USDT"):
-        value += "USDT"
-    return value[:-4] + "_USDT"
+    return f"{s[:-4]}_USDT" if s.endswith("USDT") else f"{s}_USDT"
 
-
-SYMBOLS = [normalize_symbol(s) for s in os.getenv("MEXC_SYMBOLS", "BTCUSDT,ETHUSDT").split(",")]
-SYMBOLS = list(dict.fromkeys(s for s in SYMBOLS if s))
-POLL_SECONDS = max(5, int(os.getenv("POLL_SECONDS", "10")))
-TEST_MODE = os.getenv("TEST_MODE", "false").strip().lower() in ("1", "true", "yes", "on")
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-CHAT_IDS = [x.strip() for x in os.getenv("TELEGRAM_CHAT_ID", "").split(",") if x.strip()]
-STATE_DIR = os.getenv("STATE_DIR", "state")
-TIMEFRAME_SECONDS = 300
-TIMEFRAME_LABEL = "5m"
-
-API_URL = os.getenv("MEXC_FUTURES_API_URL", "https://api.mexc.com/api/v1/contract/kline").strip().rstrip("/")
-
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
+SYMBOLS = list(dict.fromkeys(normalize_symbol(s) for s in os.getenv("MEXC_SYMBOLS", DEFAULT_SYMBOLS).split(",") if s.strip()))
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("mexc-futures-signal-bot-5m")
 SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (compatible; MEXCFuturesSignalBot/1.0)",
-    "Accept": "application/json",
-    "Cache-Control": "no-cache",
-})
+SESSION.headers.update({"Cache-Control": "no-cache", "Pragma": "no-cache", "User-Agent": "MEXC-Futures-5m-Signal-Bot/7.0"})
 
 
-def candle_color(candle):
-    if candle["close"] > candle["open"]:
-        return "GREEN"
-    if candle["close"] < candle["open"]:
-        return "RED"
-    return "DOJI"
-
-
-def emoji(value):
-    return {"GREEN": "🟢", "RED": "🔴", "DOJI": "➖"}.get(value, "➖")
+def utc(ts):
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
 def kyiv(ts):
     return datetime.fromtimestamp(ts, tz=ZoneInfo("Europe/Kyiv")).strftime("%Y-%m-%d %H:%M")
 
 
-def display_symbol(symbol):
-    return symbol
+def symbol_label(symbol):
+    return symbol.replace("_", "")
 
 
-def send(message):
+def candle_color(candle):
+    if candle["close"] > candle["open"]: return "GREEN"
+    if candle["close"] < candle["open"]: return "RED"
+    return "DOJI"
+
+
+def send_telegram(text):
     if TEST_MODE:
-        print("\n--- TEST MESSAGE ---\n" + message + "\n--------------------")
+        print("\n--- TEST TELEGRAM ---\n" + text + "\n---------------------")
         return True
     if not TOKEN or not CHAT_IDS:
-        log.warning("Telegram is not configured; message not sent: %s", message.replace("\n", " | "))
+        log.error("TELEGRAM NOT CONFIGURED: set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID")
         return False
-    success = True
+    successes = 0
     for chat_id in CHAT_IDS:
         try:
-            response = SESSION.post(
-                f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-                json={"chat_id": chat_id, "text": message},
-                timeout=15,
-            )
-            try:
-                payload = response.json()
-            except ValueError:
-                payload = {}
-            if not response.ok or not payload.get("ok"):
-                success = False
-                log.error("Telegram HTTP %s for chat %s: %s", response.status_code, chat_id, response.text[:300])
-        except requests.RequestException:
-            success = False
-            log.exception("Telegram request failed for chat %s", chat_id)
-    return success
+            r = SESSION.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", json={"chat_id": chat_id, "text": text}, timeout=15)
+            payload = r.json()
+            if r.ok and payload.get("ok"):
+                successes += 1
+                log.info("TELEGRAM SENT OK | chat=%s", chat_id)
+            else:
+                log.error("TELEGRAM ERROR | chat=%s | status=%s | body=%s", chat_id, r.status_code, r.text[:300])
+        except Exception:
+            log.exception("TELEGRAM EXCEPTION | chat=%s", chat_id)
+    return successes == len(CHAT_IDS)
 
 
-def parse_mexc_ts(value):
-    """MEXC contract kline timestamps are Unix seconds."""
-    return int(value)
+def parse_ts(value):
+    ts = int(float(value))
+    return ts // 1000 if ts > 10_000_000_000 else ts
 
 
-def fetch_candles(symbol, limit=200):
-    """Fetch public MEXC perpetual futures 5m klines (no API key required)."""
+def fetch_5m_candles(symbol, limit=300):
+    """Fetch native MEXC Futures 5-minute candles (Min5), not aggregated 1m candles."""
     now = int(time.time())
-    params = {
-        "interval": "Min5",
-        "start": now - limit * TIMEFRAME_SECONDS,
-        "end": now,
-    }
-    url = f"{API_URL}/{symbol}"
     try:
-        response = SESSION.get(url, params=params, timeout=15)
+        response = SESSION.get(API_URL.format(symbol=symbol), params={"interval": "Min5", "limit": limit, "start": now - limit * TIMEFRAME_SECONDS, "end": now}, timeout=15)
         response.raise_for_status()
     except requests.RequestException as exc:
-        body = getattr(getattr(exc, "response", None), "text", "")[:500]
-        raise RuntimeError(f"MEXC Futures request failed for {symbol}: {exc}; body={body}") from exc
-
+        body = getattr(getattr(exc, "response", None), "text", "")[:400]
+        raise RuntimeError(f"MEXC Futures 5m request failed for {symbol}: {exc}; body={body}") from exc
     try:
         payload = response.json()
     except ValueError as exc:
         raise RuntimeError(f"MEXC returned non-JSON for {symbol}: {response.text[:250]}") from exc
-    if not isinstance(payload, dict) or not payload.get("success") or not isinstance(payload.get("data"), dict):
-        raise RuntimeError(f"MEXC returned no klines for {symbol}: {str(payload)[:250]}")
-
-    data = payload["data"]
-    times = data.get("time", [])
-    opens = data.get("open", [])
-    closes = data.get("close", [])
+    if payload.get("success") is False:
+        raise RuntimeError(f"MEXC API error for {symbol}: code={payload.get('code')} message={payload.get('message')}")
+    data = payload.get("data")
+    if not isinstance(data, dict) or not isinstance(data.get("time"), list):
+        raise RuntimeError(f"Unexpected MEXC kline response for {symbol}: {str(payload)[:300]}")
+    times, opens, closes = data["time"], data.get("open", []), data.get("close", [])
+    if not (len(times) == len(opens) == len(closes)):
+        raise RuntimeError(f"MEXC candle arrays have different lengths for {symbol}")
     rows = []
-    for ts, open_price, close_price in zip(times, opens, closes):
-        try:
-            rows.append({"ts": parse_mexc_ts(ts), "open": float(open_price), "close": float(close_price)})
-        except (TypeError, ValueError):
-            continue
-    rows.sort(key=lambda candle: candle["ts"])
+    for ts, op, cl in zip(times, opens, closes):
+        rows.append({"ts": parse_ts(ts), "open": float(op), "close": float(cl)})
+    by_ts = {c["ts"]: c for c in rows}
+    rows = [by_ts[k] for k in sorted(by_ts)]
     closed = [c for c in rows if c["ts"] + TIMEFRAME_SECONDS <= now]
-    live_rows = [c for c in rows if c["ts"] <= now < c["ts"] + TIMEFRAME_SECONDS]
-    log.debug("Fetched %d closed MEXC Futures candles for %s", len(closed), symbol)
-    return closed[-150:], (live_rows[-1] if live_rows else None)
+    live = next((c for c in reversed(rows) if c["ts"] <= now < c["ts"] + TIMEFRAME_SECONDS), None)
+    return closed[-250:], live
 
 
-class Engine:
+def load_state(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        if not isinstance(state, dict): raise ValueError("state must be object")
+        return {"pending": state.get("pending", []) if isinstance(state.get("pending", []), list) else []}
+    except FileNotFoundError:
+        return {"pending": []}
+    except Exception as exc:
+        log.warning("Cannot read state %s: %s; starting clean", path, exc)
+        return {"pending": []}
+
+
+def save_state(state, path):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f: json.dump(state, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+class SignalEngine:
+    """Six-candle pattern: first three same color, next three opposite; check #7–#12."""
     def __init__(self, symbol):
         self.symbol = symbol
-        os.makedirs(STATE_DIR, exist_ok=True)
-        self.path = os.path.join(STATE_DIR, f"{symbol}.json")
+        self.state_path = os.getenv(f"STATE_FILE_{symbol}", f"state_{symbol}.json")
+        self.state = load_state(self.state_path)
+        self.pending = [p for p in self.state["pending"] if isinstance(p, dict) and "signal_ts" in p and p.get("direction") in ("LONG", "SHORT")]
         self.candles = OrderedDict()
         self.pre_sent = set()
-        self.pending = []
         self.initialized = False
-
-    def load_state(self):
-        try:
-            with open(self.path, "r", encoding="utf-8") as file:
-                state = json.load(file)
-            pending = state.get("pending", [])
-            if isinstance(pending, list):
-                self.pending = [p for p in pending if p.get("direction") in ("LONG", "SHORT") and "signal_ts" in p]
-        except FileNotFoundError:
-            pass
-        except (OSError, ValueError, TypeError) as exc:
-            log.warning("Could not read state for %s; starting clean: %s", self.symbol, exc)
-
-    def save(self):
-        state = {
-            "last_closed_ts": next(reversed(self.candles), None) if self.candles else None,
-            "pending": self.pending,
-        }
-        temporary_path = self.path + ".tmp"
-        with open(temporary_path, "w", encoding="utf-8") as file:
-            json.dump(state, file, indent=2)
-        os.replace(temporary_path, self.path)
 
     @staticmethod
     def pattern(block):
+        if len(block) != 6: return None
         colors = [candle_color(c) for c in block]
-        if colors == ["RED", "RED", "RED", "GREEN", "GREEN"]:
-            return "SHORT"
-        if colors == ["GREEN", "GREEN", "GREEN", "RED", "RED"]:
-            return "LONG"
+        if colors[:3] == ["GREEN"] * 3 and colors[3:] == ["RED"] * 3:
+            return {"direction": "LONG", "start_color": "GREEN"}
+        if colors[:3] == ["RED"] * 3 and colors[3:] == ["GREEN"] * 3:
+            return {"direction": "SHORT", "start_color": "RED"}
         return None
 
-    def seed(self, history):
-        self.load_state()
-        self.candles = OrderedDict((c["ts"], c) for c in history[-150:])
-        self.candles = OrderedDict(sorted(self.candles.items()))
+    def seed(self, closed):
+        self.candles = OrderedDict((c["ts"], c) for c in closed[-250:])
         self.initialized = True
-        self.save()
-        log.info("%s initialized with %d closed 5m candles; restored %d pending result(s)", self.symbol, len(self.candles), len(self.pending))
+        latest = next(reversed(self.candles.values())) if self.candles else None
+        log.info("INITIALIZED | %s | closed_5m=%d | restored_pending=%d%s", self.symbol, len(self.candles), len(self.pending), f" | latest={utc(latest['ts'])} {candle_color(latest)}" if latest else "")
 
-    def check_pre(self, live):
-        if not self.initialized or live is None:
-            return
+    def pattern_for_live_sixth(self, live):
+        first_ts = live["ts"] - 5 * TIMEFRAME_SECONDS
+        prior = [self.candles.get(first_ts + i * TIMEFRAME_SECONDS) for i in range(5)]
+        if any(c is None for c in prior): return None
+        pattern = self.pattern(prior + [live])
+        if not pattern: return None
+        # Match the same setup rule used by the user's supplied working code.
+        first_color = candle_color(prior[0])
+        previous_ts = first_ts - TIMEFRAME_SECONDS
+        if previous_ts in self.candles and candle_color(self.candles[previous_ts]) == first_color:
+            return None
+        return {**pattern, "start_ts": first_ts, "signal_ts": live["ts"]}
+
+    def maybe_pre_alert(self, live):
+        if not self.initialized or not live: return
         elapsed = time.time() - live["ts"]
-        # PRE-ALERT is eligible only in the final 60 seconds of candle #5.
-        if elapsed < TIMEFRAME_SECONDS - 60 or elapsed >= TIMEFRAME_SECONDS:
-            return
-        candle_ts = live["ts"]
-        if candle_ts in self.pre_sent:
-            return
-        first_ts = candle_ts - 4 * TIMEFRAME_SECONDS
-        previous = [self.candles.get(first_ts + i * TIMEFRAME_SECONDS) for i in range(4)]
-        if any(c is None for c in previous):
-            return
-        direction = self.pattern(previous + [live])
-        if direction is None:
-            return
-        self.pre_sent.add(candle_ts)
-        pattern_text = "🔴🔴🔴🟢🟢" if direction == "SHORT" else "🟢🟢🟢🔴🔴"
-        send(
-            f"⚠️ PRE-ALERT\n{self.symbol} MEXC Futures | 5m\n{pattern_text}\n"
-            f"Potential: {direction}\nCandle #5 closes at {kyiv(candle_ts + TIMEFRAME_SECONDS)} Kyiv time."
-        )
+        if not (TIMEFRAME_SECONDS - 60 <= elapsed < TIMEFRAME_SECONDS): return
+        ts = live["ts"]
+        if ts in self.pre_sent or ts in self.candles: return
+        p = self.pattern_for_live_sixth(live)
+        if not p: return
+        pat = "🔴🔴🔴🟢🟢🟢" if p["direction"] == "SHORT" else "🟢🟢🟢🔴🔴🔴"
+        msg = (f"⚠️ PRE-ALERT — {symbol_label(self.symbol)} Futures\nTimeframe: 5m\nPattern: {pat}\n"
+               f"Potential direction: {p['direction']}\nCandle #6 closes at {kyiv(ts + TIMEFRAME_SECONDS)} Kyiv time.\nFinal SIGNAL only after close.")
+        if send_telegram(msg): self.pre_sent.add(ts)
+        log.info("PRE-ALERT | %s | %s", self.symbol, p["direction"])
 
-    def add_closed(self, candle):
-        ts = candle["ts"]
-        if ts in self.candles:
-            return
-        self.candles[ts] = candle
-        self.candles = OrderedDict(sorted(self.candles.items()))
-        keys = list(self.candles)
-
-        # Signal only after candle #5 has fully closed.
-        if len(keys) >= 5 and keys[-1] == ts:
-            block = [self.candles[k] for k in keys[-5:]]
-            direction = self.pattern(block)
-            if direction:
-                self.pending.append({"start_ts": block[0]["ts"], "signal_ts": ts, "direction": direction})
-                pattern_text = "🔴🔴🔴🟢🟢" if direction == "SHORT" else "🟢🟢🟢🔴🔴"
-                send(
-                    f"🔔 SIGNAL {direction}\n{self.symbol} MEXC Futures | 5m\n{pattern_text}\n"
-                    f"Pattern closed: {kyiv(ts + TIMEFRAME_SECONDS)} Kyiv time\nChecking candles #6–#11."
-                )
-                log.info("%s SIGNAL %s at %s", self.symbol, direction, kyiv(ts))
-
-        remaining = []
-        for pending in self.pending:
-            if ts <= pending["signal_ts"]:
-                remaining.append(pending)
-                continue
-            elapsed_candles = (ts - pending["signal_ts"]) // TIMEFRAME_SECONDS
-            if elapsed_candles < 1:
-                remaining.append(pending)
-                continue
-            expected = "RED" if pending["direction"] == "SHORT" else "GREEN"
-            actual = candle_color(candle)
-            # Evaluate #6 through #11 inclusive; a matching #11 is still a WIN.
-            if actual == expected:
-                send(
-                    f"✅ WIN\n{self.symbol} MEXC Futures | 5m\nDirection: {pending['direction']}\n"
-                    f"Matching candle: #{elapsed_candles + 5} {emoji(actual)}\n"
-                    f"Signal: {kyiv(pending.get('start_ts', pending['signal_ts']))} Kyiv time."
-                )
-                continue
-            if elapsed_candles >= 6:
-                send(
-                    f"❌ LOSS\n{self.symbol} MEXC Futures | 5m\nDirection: {pending['direction']}\n"
-                    "No matching candle appeared in candles #6–#11."
-                )
-                continue
-            remaining.append(pending)
-        self.pending = remaining
-        while len(self.candles) > 150:
-            self.candles.popitem(last=False)
-        self.save()
-
-    def run_once(self):
-        history, live = fetch_candles(self.symbol)
-        if not history:
-            log.warning("%s: no complete closed 5m candles received", self.symbol)
-            return
+    def ingest(self, closed):
         if not self.initialized:
-            self.seed(history)
-            if live:
-                self.check_pre(live)
-            return
-        last_ts = next(reversed(self.candles), None) if self.candles else None
-        new_candles = [c for c in history if last_ts is None or c["ts"] > last_ts]
-        for candle in new_candles:
-            self.add_closed(candle)
-        if live:
-            self.check_pre(live)
+            self.seed(closed)
+            return 0
+        existing = set(self.candles)
+        new = [c for c in closed if c["ts"] not in existing]
+        for c in sorted(new, key=lambda x: x["ts"]):
+            self.candles[c["ts"]] = c
+            self.candles = OrderedDict(sorted(self.candles.items()))
+            while len(self.candles) > 250: self.candles.popitem(last=False)
+            self.evaluate(c["ts"])
+        if new:
+            self.state["pending"] = self.pending
+            save_state(self.state, self.state_path)
+        return len(new)
+
+    def evaluate(self, ts):
+        keys = list(self.candles)
+        idx = keys.index(ts)
+        current = self.candles[ts]
+        keep = []
+        for setup in self.pending:
+            rel = (ts - setup["signal_ts"]) // TIMEFRAME_SECONDS
+            if rel < 1:
+                keep.append(setup); continue
+            if rel > 6:
+                continue
+            number = int(rel) + 6  # rel 1 => candle #7; rel 6 => candle #12
+            expected = "RED" if setup["direction"] == "SHORT" else "GREEN"
+            if candle_color(current) == expected:
+                send_telegram(f"✅ WIN\n{symbol_label(self.symbol)} MEXC Futures | 5m\nDirection: {setup['direction']}\nMatching candle: #{number}/#12 { '🔴' if expected == 'RED' else '🟢' }\nSignal time: {kyiv(setup.get('start_ts', setup['signal_ts']))} Kyiv time.")
+                log.info("RESULT WIN | %s | %s | candle #%d", self.symbol, setup["direction"], number)
+                continue
+            if number == 12:
+                send_telegram(f"❌ LOSS\n{symbol_label(self.symbol)} MEXC Futures | 5m\nDirection: {setup['direction']}\nNo matching candle appeared in #7–#12.")
+                log.info("RESULT LOSS | %s | %s | after candle #12", self.symbol, setup["direction"])
+                continue
+            keep.append(setup)
+        self.pending = keep
+        if idx < 5: return
+        block = [self.candles[k] for k in keys[idx-5:idx+1]]
+        p = self.pattern(block)
+        if not p: return
+        start_color = p["start_color"]
+        start_ts = block[0]["ts"]
+        # Do not count a pattern if the same-color run extends before #1.
+        previous_ts = start_ts - TIMEFRAME_SECONDS
+        if previous_ts in self.candles and candle_color(self.candles[previous_ts]) == start_color: return
+        if any(x.get("signal_ts") == ts for x in self.pending): return
+        setup = {"start_ts": start_ts, "signal_ts": ts, "direction": p["direction"], "start_color": start_color}
+        pat = "🔴🔴🔴🟢🟢🟢" if p["direction"] == "SHORT" else "🟢🟢🟢🔴🔴🔴"
+        msg = (f"🔔 SIGNAL {p['direction']}\n\n{symbol_label(self.symbol)} MEXC Futures\nTimeframe: 5m\nPattern: {pat}\n"
+               f"Pattern closed: {kyiv(ts + TIMEFRAME_SECONDS)} Kyiv time\nCheck candles #7–#12; first matching candle = WIN, otherwise LOSS after #12.\n\nSignal only — no automatic trading.")
+        sent = send_telegram(msg)
+        self.pending.append(setup)
+        self.state["pending"] = self.pending
+        save_state(self.state, self.state_path)
+        log.info("SIGNAL %s | %s | sent=%s | result_window=#7-#12", p["direction"], self.symbol, sent)
 
 
-def test():
-    cases = [
-        (["RED", "RED", "RED", "GREEN", "GREEN"], "SHORT"),
-        (["GREEN", "GREEN", "GREEN", "RED", "RED"], "LONG"),
-        (["RED", "RED", "GREEN", "GREEN", "GREEN"], None),
-        (["GREEN", "GREEN", "GREEN", "RED", "DOJI"], None),
+def run_tests():
+    tests = [
+        (["GREEN","GREEN","GREEN","RED","RED","RED"], "LONG"),
+        (["RED","RED","RED","GREEN","GREEN","GREEN"], "SHORT"),
+        (["RED","RED","GREEN","GREEN","GREEN","GREEN"], None),
+        (["GREEN","GREEN","GREEN","RED","RED","DOJI"], None),
     ]
-    for colors, expected in cases:
-        candles = [{"open": 1.0, "close": (0.0 if color == "RED" else 2.0 if color == "GREEN" else 1.0)} for color in colors]
-        actual = Engine.pattern(candles)
-        assert actual == expected, (colors, expected, actual)
-        print("PASS pattern", "".join(emoji(c) for c in colors), "->", actual)
+    for colors, expected in tests:
+        block = [{"open": 1, "close": 0 if c == "RED" else 2 if c == "GREEN" else 1} for c in colors]
+        actual = SignalEngine.pattern(block)
+        assert (actual["direction"] if actual else None) == expected
+        print("PASS pattern", colors, "=>", expected)
 
     def outcome(direction, colors):
-        wanted = "RED" if direction == "SHORT" else "GREEN"
-        for index, actual in enumerate(colors, start=6):
-            if actual == wanted:
-                return "WIN", index
-        return "LOSS", 11
+        expected = "RED" if direction == "SHORT" else "GREEN"
+        for number, color in enumerate(colors, 7):
+            if color == expected: return ("WIN", number)
+        return ("LOSS", 12)
 
-    assert outcome("SHORT", ["GREEN"] * 5 + ["RED"]) == ("WIN", 11)
-    assert outcome("LONG", ["RED"] * 6) == ("LOSS", 11)
-    assert outcome("LONG", ["GREEN"] + ["RED"] * 5) == ("WIN", 6)
-    assert outcome("SHORT", ["RED"] + ["GREEN"] * 5) == ("WIN", 6)
-    print("PASS result window: checks #6–#11, WIN on #11, LOSS only after #11")
-    print("All offline tests passed.")
+    assert outcome("LONG", ["RED"]*5+["GREEN"]) == ("WIN", 12)
+    assert outcome("SHORT", ["GREEN"]*6) == ("LOSS", 12)
+    assert outcome("LONG", ["GREEN"]+["RED"]*5) == ("WIN", 7)
+    assert outcome("SHORT", ["RED"]+["GREEN"]*5) == ("WIN", 7)
+    print("PASS result window #7–#12 inclusive")
+    print("All offline tests passed")
 
 
 def main():
-    if TEST_MODE:
-        test()
-        return
-    if not SYMBOLS:
-        raise RuntimeError("MEXC_SYMBOLS is empty; set it to BTCUSDT,ETHUSDT")
-    engines = [Engine(symbol) for symbol in SYMBOLS]
+    if not SYMBOLS: raise RuntimeError("MEXC_SYMBOLS is empty; set BTCUSDT,ETHUSDT")
     log.info("Started MEXC Futures signal bot for %s on native 5m candles", ", ".join(SYMBOLS))
-    log.info("Patterns: 🔴🔴🔴🟢🟢 => SHORT; 🟢🟢🟢🔴🔴 => LONG; result window #6–#11")
-    if TOKEN and CHAT_IDS:
-        send("🤖 MEXC Futures 5m signal bot online\nSymbols: " + ", ".join(SYMBOLS) + "\nAlerts only — no automatic orders.")
+    log.info("Patterns: 🟢🟢🟢🔴🔴🔴 => LONG; 🔴🔴🔴🟢🟢🟢 => SHORT; result window #7–#12")
+    if TOKEN and CHAT_IDS: send_telegram(f"🤖 BOT ONLINE\nMEXC Futures\nSymbols: {', '.join(symbol_label(s) for s in SYMBOLS)}\nTimeframe: 5m\nAlerts only — no automatic orders.")
+    engines = {s: SignalEngine(s) for s in SYMBOLS}
+    heartbeat = {}
     while True:
-        for engine in engines:
+        for symbol, engine in engines.items():
             try:
-                engine.run_once()
-            except Exception as exc:
-                log.error("%s loop error: %s", engine.symbol, exc, exc_info=True)
+                closed, live = fetch_5m_candles(symbol)
+                if not closed:
+                    log.warning("%s | MEXC returned no complete closed 5m candles", symbol); continue
+                if not engine.initialized:
+                    engine.seed(closed)
+                else:
+                    added = engine.ingest(closed)
+                    if added: log.info("NEW DATA | %s | closed_5m=%d | added=%d | latest=%s %s | pending=%d", symbol, len(closed), added, utc(closed[-1]["ts"]), candle_color(closed[-1]), len(engine.pending))
+                if live: engine.maybe_pre_alert(live)
+                if time.time() - heartbeat.get(symbol, 0) >= 60:
+                    log.info("HEARTBEAT OK | %s | latest_closed=%s | pending=%d", symbol, utc(closed[-1]["ts"]), len(engine.pending))
+                    heartbeat[symbol] = time.time()
+            except Exception:
+                log.exception("LOOP ERROR | %s", symbol)
         time.sleep(POLL_SECONDS)
 
-
 if __name__ == "__main__":
-    main()
+    if TEST_MODE:
+        run_tests()
+        print("Timeframe: 5m | MEXC native Min5 | PRE final minute of #6 | SIGNAL after #6 close | WIN/LOSS #7–#12")
+    else:
+        main()
